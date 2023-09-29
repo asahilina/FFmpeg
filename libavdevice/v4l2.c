@@ -83,7 +83,10 @@ struct video_data {
     AVClass *class;
     int fd;
     int pixelformat; /* V4L2_PIX_FMT_* */
+    int pix_fmt;     /* AV_PIX_FMT_* */
     int width, height;
+    int bytesperline;
+    int linesize[AV_NUM_DATA_POINTERS];
     int frame_size;
     int interlaced;
     int top_field_first;
@@ -240,6 +243,7 @@ static int device_init(AVFormatContext *ctx, int *width, int *height,
         s->interlaced = 1;
     }
 
+    s->bytesperline = fmt.fmt.pix.bytesperline;
     return res;
 }
 
@@ -501,9 +505,18 @@ static int convert_timestamp(AVFormatContext *ctx, int64_t *ts)
     return 0;
 }
 
+static void v4l2_free_frame(void *opaque, uint8_t *data)
+{
+    AVFrame *frame = (AVFrame*)data;
+
+    av_frame_free(&frame);
+}
+
 static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
 {
     struct video_data *s = ctx->priv_data;
+    struct AVBufferRef *avbuf = NULL;
+    struct AVFrame *frame = NULL;
     struct v4l2_buffer buf = {
         .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
         .memory = V4L2_MEMORY_MMAP
@@ -560,13 +573,13 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
     /* Image is at s->buff_start[buf.index] */
     if (atomic_load(&s->buffers_queued) == FFMAX(s->buffers / 8, 1)) {
         /* when we start getting low on queued buffers, fall back on copying data */
-        res = av_new_packet(pkt, buf.bytesused);
-        if (res < 0) {
-            av_log(ctx, AV_LOG_ERROR, "Error allocating a packet.\n");
+        avbuf = av_buffer_alloc(buf.bytesused);
+        if (!avbuf) {
+            av_log(ctx, AV_LOG_ERROR, "Error allocating a buffer.\n");
             enqueue_buffer(s, &buf);
             return res;
         }
-        memcpy(pkt->data, s->buf_start[buf.index], buf.bytesused);
+        memcpy(avbuf->data, s->buf_start[buf.index], buf.bytesused);
 
         res = enqueue_buffer(s, &buf);
         if (res) {
@@ -575,9 +588,6 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
         }
     } else {
         struct buff_data *buf_descriptor;
-
-        pkt->data     = s->buf_start[buf.index];
-        pkt->size     = buf.bytesused;
 
         buf_descriptor = av_malloc(sizeof(struct buff_data));
         if (!buf_descriptor) {
@@ -592,19 +602,65 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
         buf_descriptor->index = buf.index;
         buf_descriptor->s     = s;
 
-        pkt->buf = av_buffer_create(pkt->data, pkt->size, mmap_release_buffer,
-                                    buf_descriptor, 0);
-        if (!pkt->buf) {
+        avbuf = av_buffer_create(s->buf_start[buf.index], buf.bytesused,
+                                 mmap_release_buffer, buf_descriptor, 0);
+        if (!avbuf) {
             av_log(ctx, AV_LOG_ERROR, "Failed to create a buffer\n");
             enqueue_buffer(s, &buf);
             av_freep(&buf_descriptor);
             return AVERROR(ENOMEM);
         }
     }
+
+    if (ctx->video_codec_id == AV_CODEC_ID_WRAPPED_AVFRAME) {
+        frame = av_frame_alloc();
+
+        if (!frame) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to create an AVFrame\n");
+            goto err_free;
+        }
+
+        frame->buf[0] = avbuf;
+
+        memcpy(frame->linesize, s->linesize, sizeof(s->linesize));
+        res = av_image_fill_pointers(frame->data, s->pix_fmt, s->height,
+                                     avbuf->data, frame->linesize);
+        if (res < 0) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to compute data pointers\n");
+            goto err_free;
+        }
+
+        frame->format  = s->pix_fmt;
+        frame->width   = s->width;
+        frame->height  = s->height;
+
+        pkt->buf = av_buffer_create((uint8_t*)frame, sizeof(*frame),
+                                    &v4l2_free_frame, ctx, 0);
+        if (!pkt->buf) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to create an AVBuffer\n");
+            goto err_free;
+        }
+
+        pkt->data   = (uint8_t*)frame;
+        pkt->size   = sizeof(*frame);
+        pkt->flags |= AV_PKT_FLAG_TRUSTED;
+        frame = NULL;
+    } else {
+        pkt->buf      = avbuf;
+        pkt->data     = avbuf->data;
+        pkt->size     = buf.bytesused;
+        avbuf = NULL;
+    }
+
     pkt->pts = buf_ts.tv_sec * INT64_C(1000000) + buf_ts.tv_usec;
     convert_timestamp(ctx, &pkt->pts);
 
     return pkt->size;
+
+err_free:
+    av_buffer_unref(&avbuf);
+    av_frame_unref(frame);
+    return AVERROR(ENOMEM);
 }
 
 static int mmap_start(AVFormatContext *ctx)
@@ -957,9 +1013,56 @@ static int v4l2_read_header(AVFormatContext *ctx)
         goto fail;
 
     st->codecpar->format = ff_fmt_v4l2ff(desired_format, codec_id);
-    if (st->codecpar->format != AV_PIX_FMT_NONE)
-        s->frame_size = av_image_get_buffer_size(st->codecpar->format,
-                                                 s->width, s->height, 1);
+    s->pix_fmt = st->codecpar->format;
+
+    if (st->codecpar->format != AV_PIX_FMT_NONE) {
+        size_t sizes[4];
+        ptrdiff_t linesize[4];
+        const AVPixFmtDescriptor *desc;
+        int max_step     [4];
+        int max_step_comp[4];
+
+        /*
+         * Per V4L2 spec, for the single plane API the line strides are always
+         * just divided down by the subsampling factor for chroma planes.
+         *
+         * For example, for NV12, plane 1 contains UV components at half
+         * resolution, and therefore has an equal line stride to plane 0.
+         */
+        desc = av_pix_fmt_desc_get(st->codecpar->format);
+        av_image_fill_max_pixsteps(max_step, max_step_comp, desc);
+
+        if (!s->bytesperline) {
+            av_log(ctx, AV_LOG_WARNING,
+                   "The V4L2 driver did not set bytesperline, guessing.\n");
+            s->bytesperline = s->width * max_step[0];
+        }
+
+        s->linesize[0] = s->bytesperline;
+        for (int i = 1; i < 4; i++) {
+            int sh = (max_step_comp[i] == 1 || max_step_comp[i] == 2) ? desc->log2_chroma_w : 0;
+            s->linesize[i] = (s->linesize[0] * max_step[i] / max_step[0]) >> sh;
+        }
+
+        /* Convert since the types are mismatched... */
+        for (int i = 0; i < 4; i++)
+            linesize[i] = s->linesize[i];
+
+        res = av_image_fill_plane_sizes(sizes, s->pix_fmt, s->height, linesize);
+        if (res < 0) {
+            av_log(ctx, AV_LOG_ERROR, "failed to fill plane sizes\n");
+            goto fail;
+        }
+
+        s->frame_size = 0;
+        for (int i = 0; i < 4; i++) {
+            if (sizes[i] > INT_MAX - s->frame_size) {
+                res = -EINVAL;
+                goto fail;
+            }
+            s->frame_size += sizes[i];
+        }
+    }
 
     if ((res = mmap_init(ctx)) ||
         (res = mmap_start(ctx)) < 0)
@@ -969,16 +1072,9 @@ static int v4l2_read_header(AVFormatContext *ctx)
 
     st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
     st->codecpar->codec_id = codec_id;
-    if (codec_id == AV_CODEC_ID_RAWVIDEO)
-        st->codecpar->codec_tag =
-            avcodec_pix_fmt_to_codec_tag(st->codecpar->format);
-    else if (codec_id == AV_CODEC_ID_H264) {
+    if (codec_id == AV_CODEC_ID_H264) {
         avpriv_stream_set_need_parsing(st, AVSTREAM_PARSE_FULL_ONCE);
     }
-    if (desired_format == V4L2_PIX_FMT_YVU420)
-        st->codecpar->codec_tag = MKTAG('Y', 'V', '1', '2');
-    else if (desired_format == V4L2_PIX_FMT_YVU410)
-        st->codecpar->codec_tag = MKTAG('Y', 'V', 'U', '9');
     st->codecpar->width = s->width;
     st->codecpar->height = s->height;
     if (st->avg_frame_rate.den)
